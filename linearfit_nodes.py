@@ -35,7 +35,7 @@ class FunctionsALL:
 
 @dataclass
 class Functions:
-    number_of_functions_per_element: Optional[int] = None
+    number_of_functions_per_element: Optional[int | None] = None
     ALL: FunctionsALL = field(default_factory=FunctionsALL)
 
 @dataclass
@@ -68,7 +68,7 @@ class PotentialConfig:
         return remove_none(asdict(self))
 
 @Workflow.wrap.as_function_node
-def ReadPickledDatasetAsDataframe(file_path:str = '', compression:str = 'gzip'):
+def ReadPickledDatasetAsDataframe(file_path:str = '', compression:str | None = 'gzip'):
 
     from ase.atoms import Atoms as aseAtoms
 
@@ -100,17 +100,6 @@ def ReadPickledDatasetAsDataframe(file_path:str = '', compression:str = 'gzip'):
     
     return df
 
-@Workflow.wrap.as_function_node
-def GetElementList(df: pd.DataFrame) -> list:
-    '''
-    Returns the elements list from the dataset dataframe
-    '''
-    # Automatically determine the list of elements
-    elements_set = set()
-    for at in df["ase_atoms"]:
-        elements_set.update(at.get_chemical_symbols())
-    elements = sorted(elements_set)
-    return elements
 
 @Workflow.wrap.as_function_node
 def ParameterizePotentialConfig(
@@ -129,20 +118,6 @@ def ParameterizePotentialConfig(
     potential_config.functions.number_of_functions_per_element = number_of_functions_per_element
 
     return potential_config
-
-@Workflow.wrap.as_function_node("bconf")
-def CreateEmptyBasisFunctions(potential_config:PotentialConfig):
-
-    '''
-    Returns the empty basis function
-    '''
-    
-    from pyace import create_multispecies_basis_config
-
-    potential_config_dict = potential_config.to_dict()
-    bconf = create_multispecies_basis_config(potential_config_dict)
-
-    return bconf
 
 @Workflow.wrap.as_function_node
 def SplitTrainingAndTesting(data_df:pd.DataFrame, training_frac:float | int = 0.5, random_state = 42):
@@ -170,12 +145,18 @@ def SplitTrainingAndTesting(data_df:pd.DataFrame, training_frac:float | int = 0.
         training_frac = 0.01
     df_training = data_df.sample(frac=training_frac,random_state = random_state)
     df_testing = data_df.loc[(i for i in data_df.index if i not in df_training.index)]
+
     return df_training, df_testing
 
+
 @Workflow.wrap.as_function_node
-def PrepareLinearACEdataset(potential_config, df_train: pd.DataFrame, df_test: pd.DataFrame, verbose: bool = False):
+def RunLinearFit(potential_config, df_train: pd.DataFrame, df_test: pd.DataFrame, verbose: bool = False):
+
+    from pyace.linearacefit import LinearACEFit, LinearACEDataset
     from pyace import create_multispecies_basis_config
-    from pyace.linearacefit import LinearACEDataset
+    
+    from pyiron_snippets.logger import logger
+    logger.setLevel(30)
 
     elements_set = set()
     for at in df_train["ase_atoms"]:
@@ -186,6 +167,7 @@ def PrepareLinearACEdataset(potential_config, df_train: pd.DataFrame, df_test: p
     elements = sorted(elements_set)
     potential_config.elements = elements
     potential_config_dict = potential_config.to_dict()
+    
     bconf = create_multispecies_basis_config(potential_config_dict)
     
     train_ds = LinearACEDataset(bconf,df_train)
@@ -195,13 +177,6 @@ def PrepareLinearACEdataset(potential_config, df_train: pd.DataFrame, df_test: p
         test_ds.construct_design_matrix(verbose=verbose)
     else:
         test_ds = None
-
-    return train_ds, test_ds
-
-@Workflow.wrap.as_function_node
-def RunLinearFit(train_ds, test_ds = None):
-
-    from pyace.linearacefit import LinearACEFit
 
     linear_fit = LinearACEFit(train_dataset= train_ds)
     linear_fit.fit()        
@@ -250,7 +225,7 @@ def SavePotential(basis, filename:str = ""):
     return basis, yace_file_path
 
 @Workflow.wrap.as_function_node
-def PredictEnergiesAndForces(basis,train_ds, test_ds = None):
+def PredictEnergiesAndForces(basis, df_train: pd.DataFrame, df_test: pd.DataFrame):
 
     from pyace import PyACECalculator
 
@@ -258,15 +233,14 @@ def PredictEnergiesAndForces(basis,train_ds, test_ds = None):
 
     ace = PyACECalculator(basis)
 
-    df_training = train_ds.df
-    training_structures = df_training.ase_atoms
+    training_structures = df_train.ase_atoms
 
     # Reference data
-    training_number_of_atoms = df_training.NUMBER_OF_ATOMS.to_numpy()
-    training_energies = df_training.energy_corrected.to_numpy()
+    training_number_of_atoms = df_train.NUMBER_OF_ATOMS.to_numpy()
+    training_energies = df_train.energy_corrected.to_numpy()
 
     training_epa = training_energies / training_number_of_atoms
-    training_fpa = np.concatenate(df_training.forces.to_numpy()).flatten()
+    training_fpa = np.concatenate(df_train.forces.to_numpy()).flatten()
     data_dict['reference_training_epa'] = training_epa
     data_dict['reference_training_fpa'] = training_fpa
 
@@ -275,17 +249,16 @@ def PredictEnergiesAndForces(basis,train_ds, test_ds = None):
     data_dict['predicted_training_epa'] = np.array(training_predict[0]) / training_number_of_atoms
     data_dict['predicted_training_fpa'] = np.concatenate(training_predict[1]).flatten()
 
-    if test_ds is not None:
+    if df_test.empty is False:
 
-        df_testing = test_ds.df
-        testing_structures = df_testing.ase_atoms
+        testing_structures = df_test.ase_atoms
         
         # Reference data
-        testing_number_of_atoms = df_testing.NUMBER_OF_ATOMS.to_numpy()
-        testing_energies = df_testing.energy_corrected.to_numpy()
+        testing_number_of_atoms = df_test.NUMBER_OF_ATOMS.to_numpy()
+        testing_energies = df_test.energy_corrected.to_numpy()
 
         testing_epa = testing_energies / testing_number_of_atoms
-        testing_fpa = np.concatenate(df_testing.forces.to_numpy()).flatten()
+        testing_fpa = np.concatenate(df_test.forces.to_numpy()).flatten()
         data_dict['reference_testing_epa'] = testing_epa
         data_dict['reference_testing_fpa'] = testing_fpa
 
@@ -324,6 +297,51 @@ def _calc_rmse(array_1,array_2,rmse_in_milli:bool = True):
         return rmse * 1000
     else:
         return rmse
+
+def make_linearfit(
+    workflow_name:str, 
+    delete_existing_savefiles = False, 
+    file_path:str = "mgca.pckl.tgz",
+    compression:str | None = None,
+    training_frac:float | int = 0.5,
+    number_of_functions_per_element:int | None = 10,
+    rcut : float | int = 6.0
+    ):
+    
+    wf = Workflow(workflow_name, delete_existing_savefiles=delete_existing_savefiles)
+    if wf.has_saved_content():  
+        return wf
+    
+    # Workflow connections
+    wf.load_dataset = ReadPickledDatasetAsDataframe(file_path = file_path, compression = compression)
+    wf.split_dataset = SplitTrainingAndTesting(data_df = wf.load_dataset.outputs.df, 
+    training_frac = training_frac)
+    wf.parameterize_potential = ParameterizePotentialConfig(number_of_functions_per_element = number_of_functions_per_element, 
+    rcut = rcut)
+    wf.run_linear_fit = RunLinearFit(potential_config = wf.parameterize_potential,
+                                                    df_train = wf.split_dataset.outputs.df_training,
+                                                    df_test=wf.split_dataset.outputs.df_testing,
+                                                    verbose = False)
+    wf.save_potential = SavePotential(basis = wf.run_linear_fit.outputs.basis)
+    wf.predict_energies_forces = PredictEnergiesAndForces(basis = wf.save_potential.outputs.basis,
+    df_train = wf.split_dataset.outputs.df_training, df_test = wf.split_dataset.outputs.df_testing)
+
+    # Input mapping
+    wf.inputs_map = {
+    'run_linear_fit__verbose': 'verbose',
+    'save_potential__filename': 'filename',
+    'parameterize_potential__number_of_functions_per_element': 'number_of_functions_per_element',
+    'parameterize_potential__rcut': 'rcut',
+    }
+
+    # Output maping
+    wf.outputs_map ={
+    'save_potential__yace_file_path': 'yace_file_path',
+    'predict_energies_forces__data_dict': 'data_dict'
+    }
+
+    return wf
+
 ########################## PLOTTING NODES ##########################
 
 # HISTOGRAM FOR ENERGY DISTRIBUTION
