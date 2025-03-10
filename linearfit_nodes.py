@@ -2,7 +2,6 @@ from pyiron_workflow import Workflow
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field, asdict
-from typing import Optional
 import matplotlib.pyplot as plt
 
 
@@ -35,7 +34,7 @@ class FunctionsALL:
 
 @dataclass
 class Functions:
-    number_of_functions_per_element: Optional[int | None] = None
+    number_of_functions_per_element: int | None = None
     ALL: FunctionsALL = field(default_factory=FunctionsALL)
 
 @dataclass
@@ -103,24 +102,19 @@ def ReadPickledDatasetAsDataframe(file_path:str = '', compression:str | None = '
 
 @Workflow.wrap.as_function_node
 def ParameterizePotentialConfig(
-    nrad_max: list =[15, 6, 4, 1], 
-    l_max:list = [0, 6, 5, 1], 
-    # number_of_functions_per_element: int | None = None, 
-    number_of_functions_per_element: int = 10,
+    number_of_functions: int | None = 10,
     rcut: float | int = 7.0
     ):
     
     potential_config = PotentialConfig()
 
     potential_config.bonds.ALL.rcut = rcut
-    potential_config.functions.ALL.nradmax_by_orders = nrad_max
-    potential_config.functions.ALL.lmax_by_orders = l_max
-    potential_config.functions.number_of_functions_per_element = number_of_functions_per_element
+    potential_config.functions.number_of_functions_per_element = number_of_functions
 
     return potential_config
 
 @Workflow.wrap.as_function_node
-def SplitTrainingAndTesting(data_df:pd.DataFrame, training_frac:float | int = 0.5, random_state = 42):
+def SplitTrainingAndTesting(data_df:pd.DataFrame, training_frac:float | int = 0.5, random_state : int = 42):
     '''
     Splits the filtered dataframe into training and testing sets based on a fraction of the dataset
 
@@ -154,6 +148,7 @@ def RunLinearFit(potential_config, df_train: pd.DataFrame, df_test: pd.DataFrame
 
     from pyace.linearacefit import LinearACEFit, LinearACEDataset
     from pyace import create_multispecies_basis_config
+    import time
     
     from pyiron_snippets.logger import logger
     logger.setLevel(30)
@@ -169,17 +164,25 @@ def RunLinearFit(potential_config, df_train: pd.DataFrame, df_test: pd.DataFrame
     potential_config_dict = potential_config.to_dict()
     
     bconf = create_multispecies_basis_config(potential_config_dict)
-    
+    t0 = time.time()
+
+
     train_ds = LinearACEDataset(bconf,df_train)
     train_ds.construct_design_matrix(verbose=verbose)
+    print("Design Matrix of Training dataset has been constructed!")
     if df_test.empty is False:
         test_ds = LinearACEDataset(bconf,df_test)
         test_ds.construct_design_matrix(verbose=verbose)
+        print("Design Matrix of Testing dataset has been constructed!")
     else:
         test_ds = None
 
     linear_fit = LinearACEFit(train_dataset= train_ds)
-    linear_fit.fit()        
+    linear_fit.fit()
+    
+    t1 = time.time()
+    total_time = t1-t0
+    print(f"Fitting Done in {total_time:.1f} seconds.")
 
     training_dict = linear_fit.compute_errors(train_ds)
     training_e_rmse = round(training_dict['epa_rmse'] * 1000, 2)
@@ -245,7 +248,8 @@ def PredictEnergiesAndForces(basis, df_train: pd.DataFrame, df_test: pd.DataFram
     data_dict['reference_training_fpa'] = training_fpa
 
     # Predicted data
-    training_predict = _get_predicted_energies_forces(ace = ace, structures= training_structures)
+    training_predict = _get_predicted_energies_forces(ace = ace, structures= training_structures,
+     data_type='Training')
     data_dict['predicted_training_epa'] = np.array(training_predict[0]) / training_number_of_atoms
     data_dict['predicted_training_fpa'] = np.concatenate(training_predict[1]).flatten()
 
@@ -263,17 +267,20 @@ def PredictEnergiesAndForces(basis, df_train: pd.DataFrame, df_test: pd.DataFram
         data_dict['reference_testing_fpa'] = testing_fpa
 
         # Predicted data
-        testing_predict =  _get_predicted_energies_forces(ace = ace, structures= testing_structures)
+        testing_predict =  _get_predicted_energies_forces(ace = ace, structures= testing_structures,
+         data_type='Testing')
         data_dict['predicted_testing_epa'] = np.array(testing_predict[0]) / testing_number_of_atoms
         data_dict['predicted_testing_fpa'] = np.concatenate(testing_predict[1]).flatten()
 
     return data_dict
 
-def _get_predicted_energies_forces(ace, structures):
+def _get_predicted_energies_forces(ace, structures, data_type:str):
+    from tqdm import tqdm
+    
     forces = []
     energies = []
 
-    for s in structures:
+    for s in tqdm(structures, desc=f"Predicting Energies and Forces of {data_type} dataset"):
         s.calc = ace
         energies.append(s.get_potential_energy())
         forces.append(s.get_forces())
@@ -316,7 +323,7 @@ def make_linearfit(
     wf.load_dataset = ReadPickledDatasetAsDataframe(file_path = file_path, compression = compression)
     wf.split_dataset = SplitTrainingAndTesting(data_df = wf.load_dataset.outputs.df, 
     training_frac = training_frac)
-    wf.parameterize_potential = ParameterizePotentialConfig(number_of_functions_per_element = number_of_functions_per_element, 
+    wf.parameterize_potential = ParameterizePotentialConfig(number_of_functions = number_of_functions_per_element, 
     rcut = rcut)
     wf.run_linear_fit = RunLinearFit(potential_config = wf.parameterize_potential,
                                                     df_train = wf.split_dataset.outputs.df_training,
@@ -345,7 +352,7 @@ def make_linearfit(
 ########################## PLOTTING NODES ##########################
 
 # HISTOGRAM FOR ENERGY DISTRIBUTION
-@Workflow.wrap.as_function_node
+@Workflow.wrap.as_function_node(use_cache = False)
 def PlotEnergyHistogram(df: pd.DataFrame, bins: int = 100, log_scale:bool = True):
     
     # Calculate energy_per_atom
@@ -354,11 +361,11 @@ def PlotEnergyHistogram(df: pd.DataFrame, bins: int = 100, log_scale:bool = True
     fig, axe = plt.subplots()
     axe.hist(df['energy_per_atom'], bins = bins, log= log_scale)
     axe.set_ylabel("Count")
-    axe.set_xlabel("Energy per atom (meV/atom)")
-    return fig, axe
+    axe.set_xlabel("Energy per atom (eV/atom)")
+    plt.show()
 
 # HISTOGRAM FOR FORCE DISTRIBUTION
-@Workflow.wrap.as_function_node
+@Workflow.wrap.as_function_node(use_cache = False)
 def PlotForcesHistogram(df: pd.DataFrame, bins: int = 100, log_scale:bool = True):
     
     array = np.concatenate(df.forces.values).flatten()
@@ -368,9 +375,9 @@ def PlotForcesHistogram(df: pd.DataFrame, bins: int = 100, log_scale:bool = True
     axe.hist(array, bins = bins, log= log_scale)
     axe.set_ylabel("Count")
     axe.set_xlabel(r"Force (eV/$\mathrm{\AA}$)")
-    return fig, axe
+    plt.show()
 
-@Workflow.wrap.as_function_node
+@Workflow.wrap.as_function_node(use_cache = False)
 def PlotEnergyFittingCurve(data_dict: dict):
 
     fig, axe = plt.subplots()
@@ -392,10 +399,10 @@ def PlotEnergyFittingCurve(data_dict: dict):
     axe.set_ylabel("Predicted E (eV/atom)")
     axe.set_title('Predicted Energy Vs Reference Energy')
     axe.legend()
-    
-    return fig, axe
+    plt.show()
 
-@Workflow.wrap.as_function_node
+
+@Workflow.wrap.as_function_node(use_cache = False)
 def PlotForcesFittingCurve(data_dict: dict):
 
     fig, axe = plt.subplots()
@@ -416,6 +423,6 @@ def PlotForcesFittingCurve(data_dict: dict):
     axe.set_ylabel("Predicted $F_i$ (eV/$\AA$)")
     axe.set_title('Predicted Force Vs Reference Force')
     axe.legend()
-    
-    return fig, axe
+    plt.show()
+
 
